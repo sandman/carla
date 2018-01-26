@@ -32,6 +32,8 @@ import logging
 import random
 import sys
 import time
+import logging
+import scipy.spatial.distance
 
 try:
     import pygame
@@ -58,6 +60,14 @@ WINDOW_HEIGHT = 600
 MINI_WINDOW_WIDTH = 320
 MINI_WINDOW_HEIGHT = 180
 
+autopilot = False
+mixed_reality = False
+hud_active = True
+show_post_processing = False
+ul_time_delay = 0.2 # Time delay for uplink in seconds
+
+#logging.basicConfig(filename='carlaClient.log', filemode='w', level=logging.DEBUG)
+
 
 def make_carla_settings():
     """Make a CarlaSettings object with the settings we need."""
@@ -80,7 +90,10 @@ def make_carla_settings():
     camera1.set_rotation(0.0, 0.0, 0.0)
     settings.add_sensor(camera1)
     camera2 = sensor.Camera('CameraSemSeg', PostProcessing='SemanticSegmentation')
-    camera2.set_image_size(MINI_WINDOW_WIDTH, MINI_WINDOW_HEIGHT)
+    if mixed_reality:
+        camera2.set_image_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+    else:
+        camera2.set_image_size(MINI_WINDOW_WIDTH, MINI_WINDOW_HEIGHT)
     camera2.set_position(200, 0, 140)
     camera2.set_rotation(0.0, 0.0, 0.0)
     settings.add_sensor(camera2)
@@ -125,14 +138,25 @@ class CarlaGame(object):
     def execute(self):
         """Launch the PyGame."""
         pygame.init()
+
+        # Adding Joystick controls here
+        self.js = pygame.joystick.Joystick(0)
+        self.js.init()
+        axis = self.js.get_axis(1)
+        jsInit = self.js.get_init()
+        jsId = self.js.get_id()
+        print("Joystick ID: %d Init status: %s Axis(1): %d" % (jsId, jsInit, axis))
+
         self._initialize_game()
+        DISPLAYSURF = pygame.display.set_mode((0, 0), pygame.RESIZABLE)
+
         try:
             while True:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         return
-                self._on_loop()
-                self._on_render()
+                meas = self._on_loop()
+                self._on_render(meas)
         finally:
             pygame.quit()
 
@@ -160,6 +184,7 @@ class CarlaGame(object):
 
     def _on_loop(self):
         self._timer.tick()
+        time.sleep(ul_time_delay)
 
         measurements, sensor_data = self.client.read_data()
 
@@ -167,8 +192,11 @@ class CarlaGame(object):
         self._mini_view_image1 = sensor_data['CameraDepth']
         self._mini_view_image2 = sensor_data['CameraSemSeg']
 
+
+
+
         # Print measurements every second.
-        if self._timer.elapsed_seconds_since_lap() > 1.0:
+        if self._timer.elapsed_seconds_since_lap() > 3.0:
             if self._city_name is not None:
                 # Function to get car position on map.
                 map_position = self._map.get_position_on_map([
@@ -193,6 +221,23 @@ class CarlaGame(object):
             self._timer.lap()
 
         control = self._get_keyboard_control(pygame.key.get_pressed())
+
+        numAxes = self.js.get_numaxes()
+        jsInputs = [ float(self.js.get_axis(i)) for i in range(numAxes)]
+
+        #if time.time() - self.prev_restart_time < 2.:
+        #control.throttle = 0.0
+        #control.steer = 0.0
+
+        control.steer = jsInputs[0]
+
+        brakeCmd = (((jsInputs[1] - (-1)) * (1.0 - 0)) / (1.0 - (-1.0))) + 0
+        throttleCmd = (((jsInputs[2] - (-1)) * (1.0 - 0)) / (1.0 - (-1.0))) + 0
+
+        control.brake = brakeCmd
+        control.throttle = throttleCmd
+        #logging.info("Control: Brake: %.2f Throttle: %.2f Steer: %.2f", brakeCmd, throttleCmd, control.steer)
+
         # Set the player position
         if self._city_name is not None:
             self._position = self._map.get_position_on_map([
@@ -201,10 +246,36 @@ class CarlaGame(object):
                         measurements.player_measurements.transform.location.z])
             self._agent_positions = measurements.non_player_agents
 
+        #logging.info(measurements.non_player_agents)
+        #perception_200 = [agent for neighbor in measurements.non_player_agents
+        #                  if scipy.spatial.distance.cdist([[measurements.player_measurements.transform.location.x,
+        #                  measurements.player_measurements.transform.location.y ]],
+        #                  [[neighbor.vehicle.transform.location.x, neighbor.vehicle.transform.location.y]]) < 200]
+        #res = [f.name for f in message.DESCRIPTOR.fields]
+        #perception = [f.name for f in measurements.non_player_agents.DESCRIPTOR.fields]
+        #neighborAgents = []
+        #for agent in measurements.non_player_agents:
+            #if agent.HasField('vehicle') or agent.HasField('pedestrian'):
+                #print(agent.vehicle.transform.location)
+                #print (measurements.player_measurements.transform.location)
+                #tmpDist =
+                #if tmpDist < 100e2:
+                #    neighborAgents.append(agent)
+
+        # neighborAgents = [agent for agent in measurements.non_player_agents if scipy.spatial.distance.cdist([[measurements.player_measurements.transform.location.x, \
+        #                                           measurements.player_measurements.transform.location.y]], \
+        #             [[agent.vehicle.transform.location.x,agent.vehicle.transform.location.y]]) < 50e2]
+        #print (neighborAgents.__len__())
+        #logging.info(perception)
+        if autopilot:
+            control = measurements.player_measurements.autopilot_control
+
         if control is None:
             self._on_new_episode()
         else:
             self.client.send_control(control)
+
+        return measurements
 
     def _get_keyboard_control(self, keys):
         """
@@ -249,6 +320,7 @@ class CarlaGame(object):
             other_lane=100 * player_measurements.intersection_otherlane,
             offroad=100 * player_measurements.intersection_offroad)
         print_over_same_line(message)
+        #logging.debug(message)
 
     def _print_player_measurements(self, player_measurements):
         message = 'Step {step} ({fps:.1f} FPS): '
@@ -261,28 +333,68 @@ class CarlaGame(object):
             other_lane=100 * player_measurements.intersection_otherlane,
             offroad=100 * player_measurements.intersection_offroad)
         print_over_same_line(message)
+        logging.debug(message)
 
-    def _on_render(self):
+    def _on_render(self, meas):
         gap_x = (WINDOW_WIDTH - 2 * MINI_WINDOW_WIDTH) / 3
         mini_image_y = WINDOW_HEIGHT - MINI_WINDOW_HEIGHT - gap_x
 
+        #meas.pl
         if self._main_image is not None:
             array = image_converter.to_rgb_array(self._main_image)
+            #print("RGB Array shape: %s" % (array.shape,))
+            mask = np.random.randint(1, size=array.shape)
+            array = np.bitwise_xor(array,mask)
             surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
             self._display.blit(surface, (0, 0))
 
-        if self._mini_view_image1 is not None:
-            array = image_converter.depth_to_logarithmic_grayscale(self._mini_view_image1)
-            surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-            self._display.blit(surface, (gap_x, mini_image_y))
 
-        if self._mini_view_image2 is not None:
-            array = image_converter.labels_to_cityscapes_palette(
-                self._mini_view_image2)
-            surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        if mixed_reality:
+            if self._mini_view_image2 is not None:
+                array1 = image_converter.labels_to_cityscapes_palette(
+                    self._mini_view_image2)
+                surface1 = pygame.surfarray.make_surface(array1.swapaxes(0, 1))
+                surface1.set_alpha(128)
+                self._display.blit(surface1, (0, 0))
+        else:
 
-            self._display.blit(
-                surface, (2 * gap_x + MINI_WINDOW_WIDTH, mini_image_y))
+            if show_post_processing:
+                if self._mini_view_image1 is not None:
+                    array = image_converter.depth_to_logarithmic_grayscale(self._mini_view_image1)
+                    surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+                    self._display.blit(surface, (gap_x, mini_image_y))
+
+                if self._mini_view_image2 is not None:
+                    array = image_converter.labels_to_cityscapes_palette(
+                        self._mini_view_image2)
+                    surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+                    self._display.blit(
+                        surface, (2 * gap_x + MINI_WINDOW_WIDTH, mini_image_y))
+
+
+        myfont = pygame.font.SysFont("sans", 25, bold=True)
+        label = myfont.render(("Current Speed: %f km/h" % meas.player_measurements.forward_speed), 1, (255, 255, 0))
+        self._display.blit(label, (WINDOW_WIDTH/2 , WINDOW_HEIGHT - 40))
+
+        neighborAgents = [agent for agent in meas.non_player_agents if scipy.spatial.distance.cdist([[meas.player_measurements.transform.location.x, \
+                                                  meas.player_measurements.transform.location.y]], \
+                    [[agent.vehicle.transform.location.x,agent.vehicle.transform.location.y]]) < 50e2]
+
+        myfont = pygame.font.SysFont("sans", 20, bold=True)
+
+        for agent in neighborAgents:
+            if agent.HasField('vehicle'):
+                # print(agent.vehicle.transform.location)
+                label = myfont.render(("Vehicle nearby" ), 1, (255, 0, 255))
+                self._display.blit(label, (WINDOW_WIDTH / 2, 40))
+            # else:
+            #
+            #
+            # if agent.HasField('pedestrian'):
+            #     # print(agent.vehicle.transform.location)
+            #     label = myfont.render(("Pedestrian nearby" ), 1, (255, 0, 255))
+            #     self._display.blit(label, (WINDOW_WIDTH / 2, 80))
+
 
         if self._map_view is not None:
             array = self._map_view
@@ -296,6 +408,7 @@ class CarlaGame(object):
             pygame.draw.circle(surface, [255, 0, 0, 255], (w_pos,h_pos), 6, 0)
             for agent in self._agent_positions:
                 if agent.HasField('vehicle'):
+                    print("found non-player agent")
                     agent_position = self._map.get_position_on_map([
                         agent.vehicle.transform.location.x,
                         agent.vehicle.transform.location.y,
@@ -336,7 +449,7 @@ def main():
     args = argparser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
+    logging.basicConfig(filename='carlaClient.log', filemode='w', format='%(levelname)s: %(message)s', level=log_level)
 
     logging.info('listening to server %s:%s', args.host, args.port)
 
